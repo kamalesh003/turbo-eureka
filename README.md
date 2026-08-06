@@ -1,705 +1,173 @@
 # turbo-eureka
 
-# **Final Architecture**
+# DRAA v2 — Decentralized Retrieval-Augmented Adaptation (Resolved)
 
-## **Decentralized Retrieval-Augmented Adaptation (DRAA)**
+### A Practically Buildable Revision of the Original DRAA Proposal
 
-### *A Fully Decentralized Query-Conditioned Hypernetwork for On-Demand LoRA Synthesis via Semantic Capability Routing*
-
----
-
-# 1. Motivation
-
-Current AI systems have several limitations:
-
-| Existing Paradigm  | Limitation                                                                |
-| ------------------ | ------------------------------------------------------------------------- |
-| RAG                | Retrieves knowledge (documents), not expertise.                           |
-| LoRA               | Requires storing thousands of adapters.                                   |
-| HyperNetworks      | Usually centralized and conditioned on fixed tasks or dataset statistics. |
-| Federated Learning | Requires aggregation servers and synchronized rounds.                     |
-| Mixture-of-Experts | Experts are fixed and exist within a single model.                        |
-
-**Core Idea**
-
-Instead of retrieving documents or downloading pre-trained adapters, retrieve **distributed expertise** and **synthesize the required LoRA adapter on demand**.
-
-The network behaves like a decentralized ecosystem of specialists.
+This is not a rewrite for polish. Every change below exists because a specific flaw in the original made the system either impossible to implement or mathematically inconsistent. Where the original made an unproven claim, this version replaces it with a mechanism built from techniques that are independently demonstrated to work, and states plainly where research risk remains.
 
 ---
 
-# 2. High-Level Architecture
+## 1. The central fix: replace "generate from scratch" with "retrieve, then compose"
 
-```text
-                  User Query
-                       │
-                       ▼
-          Semantic Instruction Encoder
-               (Sentence Transformer)
-                       │
-                       ▼
-             Semantic Capability Vector
-                       │
-                       ▼
-        Distributed Capability Discovery Layer
-         (ANN + Gossip Capability Directory)
-                       │
-        ┌──────────────┼───────────────┐
-        ▼              ▼               ▼
-     Medical       Vision          Statistics
-      Peer            Peer             Peer
-        │              │                │
-        ▼              ▼                ▼
- Capability Router Capability Router Capability Router
-        │              │                │
-        ▼              ▼                ▼
- Domain Hypernetwork Domain Hypernetwork Domain Hypernetwork
-        │              │                │
-        ▼              ▼                ▼
- Partial LoRA       Partial LoRA     Partial LoRA
-        └──────────────┬───────────────┘
-                       ▼
-              Adaptive LoRA Fusion
-                       │
-                       ▼
-          Frozen Foundation Model
-                       │
-                       ▼
-                  Final Response
+**Original flaw:** A domain hypernetwork `H_i` was expected to map a single sentence-embedding `z` (a few hundred to ~1500 floats) directly to a full LoRA delta `ΔW_i` (potentially millions of parameters) for an arbitrary unseen query. This mapping is underdetermined — there is no published result showing a hypernetwork can generate a competent task-specific LoRA from an embedding alone, for open-domain queries it has never seen. This was the load-bearing assumption of the entire system, and it doesn't hold.
+
+**Fix:** Stop generating weights from nothing. Generate them by **composing a small set of pre-trained anchor LoRAs**, selected and weighted by the hypernetwork. This is a much better-posed problem, and it's grounded in techniques that already work:
+
+- **LoRA composition / task arithmetic** — combining multiple pre-trained LoRAs via learned or heuristic weights is demonstrated to work (LoraHub-style composition, TIES-merging, task-vector arithmetic). The hypernetwork's job shrinks from "invent ΔW" to "pick weights over a known basis," which is a much smaller and better-conditioned function to learn.
+- Each peer maintains a bank of **N anchor LoRAs** (tens to low hundreds, not thousands) trained offline on curated sub-tasks within its domain — e.g. a Medical peer might hold anchors for "radiology report interpretation," "differential diagnosis," "drug interaction," etc.
+- At query time, the peer's hypernetwork `H_i` takes `z` (the query embedding) and outputs a **coefficient vector** `β ∈ R^N` over its own anchor bank, not a full weight tensor:
+
 ```
+β_i = H_i(z)              # small MLP, output dim = N (tens), not millions
+ΔW_i = Σ_k β_i[k] · A_i[k] # weighted sum of pre-trained anchor LoRAs
+```
+
+This is orders of magnitude smaller as a learning problem, reuses proven merging math, and is falsifiable in a small offline experiment before any distributed infrastructure is built (see §9).
+
+- **Storage cost this reintroduces:** each peer now stores N anchor LoRAs locally instead of zero. This is the honest tradeoff — the original's "no adapter storage" claim was only achievable because the generation step was unrealistic. N × (LoRA size, typically 1–10MB) is cheap local storage, not a scalability problem.
 
 ---
 
-# 3. Peer Architecture
+## 2. Fix the base-model synchronization gap
 
-Every peer is autonomous.
+**Original flaw:** §2 and §11 apply every peer's LoRA to "the frozen foundation model," while §15/§16 claim peers can join and leave with "no synchronization required." These are inconsistent — fusing adapters across peers only works if all peers share the identical base model (same weights, same architecture, same layer names).
 
-Each peer contains:
+**Fix:** State the precondition explicitly instead of hiding it.
 
-```text
-Peer
-
-├── Local Dataset
-├── Foundation Model
-├── Domain Hypernetwork
-├── Capability Encoder
-├── Capability Index
-├── Neighbor Directory
-├── LoRA Cache
-├── Gossip Manager
-├── Local Trainer
-└── Orthogonal Memory Tracker
-```
-
-The peer never shares:
-
-* datasets
-* gradients
-* model weights
-
-Only lightweight semantic summaries and capability information.
+- The network maintains a small **Base Model Registry**: a signed manifest of `{model_id, architecture_version, weight_hash}` that all participating peers must match to be routable together.
+- A peer's capability advertisement includes its base-model hash. The fusion router only merges adapters from peers matching the requester's base model.
+- Peers on a different base model version form a **separate routing partition** — this is normal, not an error state, and is the honest version of "no synchronization required": no *continuous* synchronization is needed, but a *one-time compatibility contract* is.
 
 ---
 
-# 4. Local Learning Phase
+## 3. Fix the fusion math / partial-adapter dimension mismatch
 
-Each peer specializes independently.
+**Original flaw:** §9 describes peers generating adapters for *different layers* (medical → "clinical reasoning layers," vision → "visual encoder adaptation"), while §20's fusion formula (`ΔW = Σ α_i ΔW_i`) is a scalar-weighted sum, which is only valid if every `ΔW_i` has the *same shape and targets the same layers*. As written, the architecture contradicts itself.
 
-Example
+**Fix:** Define a **canonical LoRA schema** shared network-wide, and route fusion at the correct granularity.
 
-Medical Peer
-
-```text
-Medical Reports
-
-↓
-
-Train Domain Hypernetwork
-
-↓
-
-Generate Medical LoRAs
-
-↓
-
-Improve Foundation Model
-
-↓
-
-Update Capability Representation
-```
-
-Programming peer does the same.
-
-Finance peer does the same.
-
-No synchronization required.
+- Fix a shared target-module list up front (e.g., `{q_proj, k_proj, v_proj, o_proj, mlp.up, mlp.down}` for each transformer block, with a fixed rank `r` per module) — this is the standard practice in real LoRA merging work and is what makes `Σ α_i ΔW_i` well-defined at all.
+- Peers whose specialty genuinely concentrates in different modules (e.g. a Vision peer only meaningfully updates the visual encoder’s projection layers) simply produce **near-zero coefficients for irrelevant modules** rather than being architecturally restricted to a module subset. This turns "different peers touch different layers" from an architectural inconsistency into an emergent, learned sparsity pattern — which is compatible with the shared-schema summation.
+- Fusion becomes **two-level**, matching how the peers actually differ:
+  1. **Intra-peer**: `ΔW_i = Σ_k β_i[k]·A_i[k]` (composition over that peer's own anchor bank, §1).
+  2. **Inter-peer**: `ΔW = Σ_i α_i(z)·ΔW_i` (weighting across peers, as in the original), now valid because every `ΔW_i` shares the canonical schema.
+- `α_i(z)` (inter-peer weight) is produced by a lightweight, separately-trained **Fusion Router** — a small model taking `z` and the set of matched peers' capability vectors, outputting a softmax over peers. This can be trained via distillation from held-out queries with known best-peer labels, or via a bandit/contextual-routing objective online.
 
 ---
 
-# 5. Capability Representation
+## 4. Fix gossip staleness and give discovery a deterministic fallback
 
-This is one of the major innovations.
+**Original flaw:** §6–7 describe gossip-propagated capability vectors with no fanout, TTL, convergence bound, or partition handling. Under gossip alone, a peer whose capability just changed can be invisible to distant queriers for an unbounded time, and there's no way to reason about "the query definitely reached the best-matched peer."
 
-Instead of advertising
+**Fix:** Use gossip for cheap approximate discovery, backed by a structured layer for guarantees.
 
-```text
-"I know medicine."
-```
-
-the peer advertises a learned capability embedding.
-
-Generated from
-
-* training corpus embeddings
-* successful task embeddings
-* adapter latent vectors
-* performance history
-
-Result
-
-```text
-Capability Vector
-
-cmedical
-```
-
-This vector is much richer than keywords.
+- **Capability vectors are versioned** (`{peer_id, vector, version, ttl, signature}`). Anti-entropy gossip (periodic full-state reconciliation between random peer pairs, not just push) bounds staleness to `O(log N)` rounds with high probability — standard epidemic-protocol result; the design must pick and state explicit fanout (e.g. 3–6 peers/round) and round interval.
+- For queries where "best possible match" matters more than latency, back gossip with a **Kademlia-style DHT** keyed by locality-sensitive hashes (LSH) of the capability vector. This gives `O(log N)` deterministic lookup instead of relying purely on epidemic spread, at the cost of standard DHT maintenance overhead. Gossip stays as the cheap/default path; DHT lookup is the fallback when gossip's approximate answer set looks thin or the query is high-value.
+- Expired (TTL-lapsed) capability entries are dropped locally — this is what actually implements §16's "no global coordination needed on leave," rather than an unstated assumption.
 
 ---
 
-# 6. Gossip-Based Capability Exchange
+## 5. Fix the security model — Sybil resistance and adapter integrity
 
-Peers continuously gossip only metadata.
+**Original flaw:** §17 asserts a "trust score" with no computation mechanism, no Sybil defense, and no check that a peer's returned `ΔW_i` is actually beneficial rather than adversarial or low-quality.
 
-Example
+**Fix, as three separate concrete mechanisms:**
 
-Peer A
-
-```text
-Capability updated
-
-↓
-
-Neighbors receive
-
-↓
-
-Update directory
-
-↓
-
-Forward occasionally
-```
-
-Shared information
-
-```text
-Peer ID
-
-Capability Vector
-
-Timestamp
-
-Trust Score
-
-Available Hypernetworks
-```
-
-NOT
-
-* datasets
-* adapters
-* LLM weights
-
-Eventually the entire network develops an approximate semantic map.
+- **Sybil resistance:** peer identity requires either (a) proof-of-stake — a bonded deposit slashed on detected misbehavior, or (b) a rate-limited, resource-costly join process (proof-of-work or verified external identity). Pure open self-registration of "capability vectors" with no cost is Sybil-able by construction; the original design has no answer to an attacker spinning up 1,000 fake "medical experts."
+- **Capability verification, not self-report:** new/updated capability claims are spot-checked with **known-answer canary queries** drawn from a held-out benchmark set per domain. A peer's advertised capability vector is only trusted commensurate with its measured accuracy on canaries, not its self-description. This directly replaces the "trust score gradually decreases" hand-wave with a measurable quantity.
+- **Adapter-output integrity:** returned `ΔW_i` (or `β_i`, the smaller coefficient vector under the v2 design) is signed by the peer. The fusion router additionally runs a lightweight **sanity check pass** — e.g., verify the fused model's output on the actual query doesn't diverge pathologically from the frozen base model's output (a cheap perplexity/consistency check) before returning to the user — to catch a compromised or adversarial peer without needing a full trust model to prevent every failure mode.
 
 ---
 
-# 7. Dynamic Capability Discovery
+## 6. Fix the cost model — the real bottleneck is inference-time compute, not bandwidth
 
-A user asks
+**Original flaw:** §18 compares "capability vector (KB)" against "sending a 7B model," which isn't the real cost tradeoff. The recurring cost is running `H_i` (or now, the much cheaper coefficient-generator) and the merge operation, per query, on every matched peer.
 
-> Detect diabetic retinopathy.
+**Fix — make the cost model explicit and design against it:**
 
-Pipeline
-
-```text
-Query
-
-↓
-
-Sentence Transformer
-
-↓
-
-Query Embedding z
-
-↓
-
-ANN Search
-
-↓
-
-Nearest Capabilities
-```
-
-Returns
-
-```text
-Medical Peer
-
-Vision Peer
-
-Image Processing Peer
-```
-
-Only relevant peers participate.
+- Under the v2 design, `H_i` outputs a length-N coefficient vector via a small MLP — this is cheap (sub-millisecond, negligible compared to a single foundation-model forward pass), which is *why* §1's fix matters for cost, not just correctness.
+- The dominant cost is the **merge-and-inference** step (applying `ΔW` and running the foundation model forward pass), which happens once per query regardless of how many peers contributed — this cost is the same order as ordinary single-adapter LoRA inference, not multiplied by the number of matched peers.
+- **Adapter caching (original §12) is kept and is now cheap to key correctly**: cache key = `(base_model_hash, LSH-bucket(z))`, value = the fused `ΔW`. Cache hit skips both the per-peer coefficient generation and the fusion step entirely.
 
 ---
 
-# 8. Query-Conditioned Hypernetwork
+## 7. Fix continual learning — name the actual mechanism
 
-Unlike previous work
+**Original flaw:** §14 asserts "orthogonal memory tracking" without specifying what space the projection happens in, or how it applies to a hypernetwork rather than a directly-trained model.
 
-Traditional
+**Fix:** Apply **Gradient Projection Memory (GPM)** — a documented continual-learning technique — at the correct point in the v2 architecture:
 
-```text
-Dataset Statistics
-
-↓
-
-Hypernetwork
-
-↓
-
-LoRA
-```
-
-Proposed
-
-```text
-Semantic Query Vector
-
-↓
-
-Domain Hypernetwork
-
-↓
-
-Task-Specific LoRA
-```
-
-Each peer synthesizes a custom adapter specifically for this request.
-
-No precomputed LoRA storage required.
+- Each peer stores a low-rank basis of the **gradient subspace** used by past updates to its anchor-selection network (the small `H_i` MLP from §1), not the foundation model.
+- When `H_i` is updated after new local training, new gradients are projected to be orthogonal to this stored basis before being applied, which is the standard GPM mechanism for reducing catastrophic forgetting in a small trained network — and it's tractable here specifically *because* `H_i` is now small (§1's fix), where doing this against a full weight-generation hypernetwork would have been computationally impractical.
+- The **capability vector** update is a downstream summary of this process (e.g., derived from `H_i`'s current parameters plus recent canary performance), not an independently-invented "orthogonal projection of capability vectors" as the original vaguely implied.
 
 ---
 
-# 9. Partial Adapter Generation
+## 8. Revised end-to-end pipeline
 
-Instead of generating the entire adapter
-
-each domain generates only its expertise.
-
-Medical peer
-
-```text
-Clinical reasoning layers
 ```
-
-Vision peer
-
-```text
-Visual encoder adaptation
-```
-
-Statistics peer
-
-```text
-Analysis layers
-```
-
-Much smaller.
-
-Much faster.
-
-Much more scalable.
-
----
-
-# 10. Adaptive LoRA Fusion
-
-Simple averaging is avoided.
-
-Instead
-
-```text
-Query
-
-↓
-
-Fusion Router
-
-↓
-
-Peer Confidence
-
-↓
-
-Weighted Combination
-```
-
-Example
-
-Medical query
-
-```text
-Medical 70%
-
-Vision 20%
-
-Statistics 10%
-```
-
-Different query
-
-```text
-Vision 60%
-
-Medical 20%
-
-Programming 20%
-```
-
-Dynamic composition.
-
----
-
-# 11. LoRA Injection
-
-Generated adapter
-
-```text
-Merged LoRA
-
-↓
-
-Injected
-
-↓
-
-Frozen Foundation Model
-```
-
-Inference proceeds normally.
-
-After completion
-
-adapter may be discarded or cached.
-
----
-
-# 12. Adapter Cache
-
-Frequently requested semantic regions reuse previous adapters.
-
-```text
-Semantic Vector
-
-↓
-
-Approximate Cache Search
-
-↓
-
-Hit?
-
-↓
-
-Reuse Adapter
-```
-
-No regeneration required.
-
----
-
-# 13. Continuous Learning
-
-After each successful task
-
-```text
-Experience
-
-↓
-
-Fine-tune Hypernetwork
-
-↓
-
-Update Capability Vector
-
-↓
-
-Update Local Index
-
-↓
-
-Gossip Summary
-```
-
-The network evolves continuously.
-
----
-
-# 14. Orthogonal Memory Tracking
-
-Every peer maintains an orthogonal subspace of learned knowledge.
-
-New updates
-
-```text
-Update
-
-↓
-
-Projection
-
-↓
-
-Known Component
-
-+
-
-Novel Component
-```
-
-Benefits
-
-* continual learning
-* reduced catastrophic forgetting
-* cleaner capability representations
-* future unlearning support
-
----
-
-# 15. Peer Join
-
-New peer
-
-```text
-Robotics Peer
-```
-
-Advertises
-
-```text
-Capability Vector
-```
-
-Neighbors
-
-```text
-Update ANN
-
-↓
-
-Start routing
-```
-
-No retraining.
-
-No restart.
-
----
-
-# 16. Peer Leave
-
-Peer disconnects.
-
-Capability expires automatically.
-
-Queries simply route elsewhere.
-
-No global coordination.
-
----
-
-# 17. Security Layer
-
-Every peer has
-
-```text
-Identity
-
-Signature
-
-Trust Score
-```
-
-Capability advertisements are signed.
-
-Malicious peers gradually lose trust.
-
-Routing prefers trusted experts.
-
----
-
-# 18. Scalability
-
-Communication is tiny.
-
-Instead of transmitting
-
-```text
-7B model
-```
-
-or
-
-```text
-100MB LoRA
-```
-
-transmit
-
-```text
-Capability Vector
-
-≈ few KB
-```
-
-Hypernetworks remain local.
-
----
-
-# 19. End-to-End Workflow
-
-```text
 User Query
-      │
-      ▼
-Semantic Instruction Encoder
-      │
-      ▼
-Semantic Query Vector
-      │
-      ▼
-Distributed ANN Search
-      │
-      ▼
-Capability-Matched Peers
-      │
-      ▼
-Each Peer's Domain Hypernetwork
-      │
-      ▼
-Partial LoRA Generation
-      │
-      ▼
-Adaptive Fusion Router
-      │
-      ▼
-Merged LoRA Adapter
-      │
-      ▼
-Foundation Model
-      │
-      ▼
-Inference
-      │
-      ▼
-Response
-      │
-      ▼
-Feedback
-      │
-      ▼
-Local Hypernetwork Update
-      │
-      ▼
-Capability Vector Update
-      │
-      ▼
-Gossip Propagation
+    │
+    ▼
+Semantic Instruction Encoder (Sentence Transformer) → z
+    │
+    ▼
+Adapter Cache Lookup (base_model_hash, LSH-bucket(z))
+    │
+    ├── HIT → return cached ΔW → skip to Inference
+    │
+    ▼ MISS
+Distributed Discovery (Gossip directory + DHT fallback)
+    │
+    ▼
+Matched Peers (only peers on matching Base Model Registry entry)
+    │
+    ▼
+Per-Peer: β_i = H_i(z)              [small MLP → coefficients over anchor bank]
+Per-Peer: ΔW_i = Σ_k β_i[k]·A_i[k]  [compose from pre-trained anchors, canonical schema]
+    │
+    ▼
+Fusion Router: α_i(z) over matched peers
+    │
+    ▼
+ΔW = Σ_i α_i(z)·ΔW_i   [valid: all ΔW_i share canonical module/rank schema]
+    │
+    ▼
+Integrity check (consistency probe vs. frozen base model)
+    │
+    ▼
+Inject ΔW into Frozen Foundation Model → Inference → Response
+    │
+    ▼
+Cache ΔW at (base_model_hash, LSH-bucket(z))
+    │
+    ▼
+Feedback → GPM-constrained update of H_i → canary re-verification → versioned capability-vector gossip update
 ```
 
 ---
 
-# 20. Mathematical Formulation
+## 9. What's still genuinely unproven, and how to test it before building anything else
 
-For peer (i):
+Be precise about remaining research risk instead of implying the whole thing is settled:
 
-Capability representation:
-
-[
-c_i = E(D_i)
-]
-
-where:
-
-* (D_i) = local expertise
-* (E) = capability encoder
-
-Query embedding:
-
-[
-z = T(q)
-]
-
-where:
-
-* (q) = user query
-* (T) = sentence transformer
-
-Peer selection:
-
-[
-P = \text{ANN}(z,{c_i})
-]
-
-Hypernetwork synthesis:
-
-[
-\Delta W_i = H_i(z)
-]
-
-where:
-
-* (H_i) = domain hypernetwork
-* (\Delta W_i) = generated LoRA
-
-Fusion:
-
-[
-\Delta W = \sum_i \alpha_i(z)\Delta W_i
-]
-
-where:
-
-* (\alpha_i) = learned fusion weight
-
-Inference:
-
-[
-y = F(x;\Delta W)
-]
-
-where (F) is the frozen foundation model.
+1. **Does anchor-composition beat single-anchor retrieval?** i.e., does learning `β_i` over N anchors actually outperform simply retrieving the single closest-matching anchor LoRA by embedding similarity? This is the one experiment that validates or kills the hypernetwork component. Run it offline, single-peer, before building any distributed layer: take one domain, a fixed anchor bank, hold out queries, compare (a) nearest-anchor retrieval, (b) learned-coefficient composition, (c) a trained-from-scratch full LoRA per query (upper bound, infeasible in production but useful as a ceiling). If (b) doesn't measurably beat (a), the hypernetwork adds complexity without benefit and the system should just do retrieval.
+2. **Fusion router quality** — whether `α_i(z)` learned from limited routing feedback actually beats a simpler heuristic (e.g., cosine similarity between `z` and each peer's capability vector, softmax-normalized) needs its own small-scale test before justifying a separately trained router.
+3. **Canary-based trust** assumes a maintained, hard-to-game benchmark set per domain exists or can be built — this is an ongoing content-curation cost, not a one-time engineering cost, and should be budgeted as such.
 
 ---
 
-# 21. Core Research Contributions
+## 10. Summary of what changed and why
 
-1. **Decentralized Capability Routing** using semantic capability embeddings propagated via gossip, eliminating centralized registries.
-2. **Query-Conditioned Hypernetwork Synthesis**, generating task-specific LoRA adapters directly from semantic query embeddings.
-3. **Distributed Partial Adapter Generation**, where specialized peers synthesize only the adapter components aligned with their expertise.
-4. **Adaptive Multi-Peer LoRA Fusion**, dynamically weighting synthesized adapters based on query relevance and peer confidence.
-5. **Continual Capability Evolution**, enabling peers to update their expertise, advertise changes through lightweight gossip, and support asynchronous network growth without synchronized retraining.
-6. **Orthogonal Memory Tracking** to reduce catastrophic forgetting, preserve previously learned capabilities, and provide a pathway toward approximate machine unlearning.
+| Component | Original | v2 Fix | Reason |
+|---|---|---|---|
+| Adapter generation | Full ΔW from embedding alone | Learned coefficients over pre-trained anchor bank | Original mapping is underdetermined / unproven at scale |
+| Base model handling | Implied fully independent peers | Explicit Base Model Registry, hash-matched routing | Fusion requires identical base weights; original was inconsistent |
+| Fusion math | Scalar sum over free-form partial adapters | Canonical module/rank schema + two-level (intra-peer, inter-peer) fusion | Original math only valid if shapes match; original text implied they wouldn't |
+| Discovery | Pure gossip, no bounds | Gossip + DHT fallback, versioned/TTL'd entries | No convergence or staleness guarantees otherwise |
+| Security | "Trust score," unspecified | Stake/cost-based Sybil resistance + canary verification + signed, sanity-checked adapters | Original had no defense against fake capability claims |
+| Cost model | KB vs. GB bandwidth comparison | Explicit accounting of per-query inference/merge cost, cache-key design | Real bottleneck is compute, not bandwidth |
+| Continual learning | "Orthogonal memory tracking," unspecified | GPM on the small coefficient-generator network specifically | Original didn't specify space or target; only tractable on a small network |
 
----
-
-# Why this architecture is compelling
-
-The key shift is that **knowledge is no longer the unit of retrieval—capability is**. Traditional RAG retrieves documents, federated learning exchanges model updates, and Mixture-of-Experts routes among fixed experts. In this architecture, peers advertise **what they can synthesize**, not what they store. A semantic query discovers the most relevant distributed experts, each expert generates a task-specific LoRA adapter on demand through its local hypernetwork, and the resulting adapters are fused into a temporary specialization for the frozen foundation model. This transforms a distributed AI network from a repository of static models into a living ecosystem that continuously learns, evolves, and composes expertise without central coordination.
+The system as revised is buildable with existing, demonstrated components (LoRA composition/merging, epidemic + DHT discovery, GPM continual learning, stake-based Sybil resistance) rather than resting on a single unproven generative capability. The one remaining open research question — whether learned anchor-composition beats simple retrieval — is now isolated, cheap to test, and doesn't require any distributed infrastructure to answer.
