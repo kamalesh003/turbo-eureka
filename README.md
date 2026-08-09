@@ -1,157 +1,155 @@
-# RoPE-Frequency-Aware KV Page Routing
+# RoPE-Frequency-Aware KV Page Routing — Detailed Resolved Proposal
 
-## Intention
+## 0. Motivating Summary
 
-Long-context LLM decoding is increasingly bottlenecked not by compute, but by **memory traffic**: at every generated token, one new query vector must be compared against a historical KV cache that can span tens or hundreds of thousands of tokens, and reading that cache from GPU HBM dominates decode latency.
+Long-context decoding is memory-bandwidth-bound: every generated token requires reading a historical KV cache from HBM, and that read dominates latency far more than the attention compute itself. Existing query-aware routers (Quest, ShadowKV) already solve "read only the KV pages that matter" — but they pay for a full-dimensional routing index on every page, every step. This proposal asks a narrower question: **can the routing index itself be shrunk to just the RoPE dimensions that stay geometrically stable within a page, without losing recall relative to the best existing alternatives?**
 
-The intention of this idea is **not** to make KV reads faster, and **not** to propose a new caching architecture. Hierarchical query-aware page selection (cheap filter → top-K candidate pages → exact attention on survivors) is already established by systems like Quest. The intention is narrower and more specific:
-
-> **To test whether a compact routing index built from only the low-frequency RoPE dimensions of post-RoPE keys can select the same important KV pages as a full-dimensional index — at substantially lower routing cost — and to determine where, if anywhere, this beats the existing alternatives.**
-
-In one sentence: *don't make every KV read faster — make the decision about which KV pages deserve to be read cheaper, using RoPE's own frequency structure as the mechanism for that decision.*
+The resolved design below folds in three structural fixes — a local bypass window, a sharpened theoretical wedge against the strongest competitor, and mandatory outlier instrumentation — so that the experiment tests exactly one variable at a time.
 
 ---
 
-## Core Idea
+## 1. Core Objective (Restated Precisely)
 
-Reorganize the KV cache from passive tensor storage into a query-routable structure with two clearly separated concerns:
+> Determine whether a min/max routing index built **only** from the low-frequency subset of post-RoPE key dimensions matches the page-selection quality of a full-dimensional index (Quest-style), and — as the sharper, falsifiable claim — **beats Pre-RoPE routing specifically on far-away, weakly-similar target pages**, where positional decay is the only usable signal.
 
-1. **Routing** (approximate) — decide which physical KV pages are worth reading.
-2. **Attention** (exact) — once pages are selected, read and attend over their complete, unmodified K/V.
+This is not a general "sparse attention is good" claim. It is a claim about which *subset of dimensions* carries the routing-relevant signal, isolated from every other design choice (page size, top-K, attention kernel, etc., all held fixed across conditions).
 
-Nothing about the underlying Transformer or its attention computation changes. Only the process of deciding *which historical pages get physically loaded* changes.
+---
+
+## 2. Resolved Architecture
+
+### 2.1 Tier 1 — Always-On Local Window
+
+**Design.** The most recent `W` tokens (rounded up to the nearest 1–2 physical pages) are never routed — they are always loaded and always included in exact attention, every decode step, regardless of what the router would have selected.
+
+**Why this is structural, not optional.** High-frequency RoPE dimensions complete near-full rotations within a single page span, so a query's dot product against nearby keys stays sharply discriminative for recent tokens specifically *because* of the high-frequency channels. Tier 2's index deliberately excludes those channels. Without Tier 1, any perplexity degradation observed downstream would be ambiguous — it could reflect a genuine long-range routing failure (the thing being tested) or simply the model losing its most recent context (an artifact of the design, not a finding). Tier 1 removes that ambiguity by construction.
+
+**Parameterization.** `W` is fixed once (e.g., 1–2 pages' worth of tokens, matched to whatever local-window size the baseline systems (Quest, ShadowKV) already assume, if any) and held constant across configurations A, B, and C. It is explicitly *not* part of the swept variable set — sweeping it would reintroduce a confound between "how much is locally exempted" and "how good is the long-range index," which is precisely what Tier 1 is meant to prevent.
+
+### 2.2 Tier 2 — Low-Frequency Long-Range Index
+
+Unchanged in mechanism from the original proposal, now scoped to apply only outside the Tier-1 window:
+
+- RoPE is applied normally to keys; nothing about the model's forward pass changes.
+- For each physical page outside the local window, store min/max bounds computed **only over the low-frequency dimension subset** of the post-RoPE keys.
+- At decode time, project the live query onto the same low-frequency subset.
+- Score each page's bounds against the projected query (identical scoring function to Quest — just fewer dimensions).
+- Rank and keep top-K pages.
+- Load **full-dimensional, unmodified** K/V for the selected pages only, and run ordinary exact attention.
+
+High-frequency dimensions are never discarded from the model itself — only from the index used to decide *which pages to read*.
+
+### 2.3 Combined Data Flow
 
 ```text
                          Query Q
                             │
-                            ▼
-                ┌─────────────────────┐
-                │ Compact KV-page     │
-                │ routing index       │
-                │ (low-frequency      │
-                │ post-RoPE dims only)│
-                └──────────┬──────────┘
-                           │
-                       rank pages
-                           │
-                           ▼
-                         Top-K
-                           │
-                           ▼
-                  Read full K/V only
-                  from selected pages
-                           │
-                           ▼
-                    Exact attention
+              ┌─────────────┴─────────────┐
+              │                           │
+     Tier 1: local window            Tier 2: routing index
+     (last W tokens, always          (low-freq post-RoPE
+      loaded, no routing)             min/max, all older pages)
+              │                           │
+              │                      rank pages → top-K
+              │                           │
+              │                  read full K/V of top-K
+              │                           │
+              └─────────────┬─────────────┘
+                             ▼
+                    exact attention over
+                 {local window ∪ selected pages}
 ```
 
 ---
 
-## The Specific Mechanism
+## 3. Theoretical Wedge Against Baseline C (Pre-RoPE Scoring)
 
-RoPE applies rotations at different frequencies to different dimension-pairs of each key vector. Within a page covering a narrow range of token positions, the **low-frequency** dimensions rotate very little across that range — their values stay relatively stable and therefore make a tight, discriminative page-level summary. The **high-frequency** dimensions rotate almost a full cycle within the same narrow range, so a page-level summary built from them is inherently loose, regardless of how it's computed.
+This is the part of the proposal that was previously a hand-wave ("let's see empirically") and is now a specific, checkable mechanism.
 
-The proposed routing index therefore:
+**The claim.** RoPE rotates each dimension-pair of a key vector by an angle proportional to `position × θ_d`, where `θ_d` decreases geometrically with dimension index `d`. For low-frequency `d`, `θ_d` is tiny, so:
 
-- Applies RoPE normally (nothing about the model changes).
-- For each physical KV page, stores **min/max statistics computed only over the low-frequency dimension subset** of the post-RoPE keys.
-- At each decode step, projects the live query onto the same frequency subset and scores each page's min/max bounds against it — exactly Quest's scoring method, just on fewer dimensions.
-- Ranks all pages by this cheap score and keeps the top-K.
-- Reads the **full, unrestricted** K/V (all dimensions, all channels) only for the selected top-K pages, and runs ordinary exact attention on them.
+- **Within a page** (a narrow span of positions), the rotation is nearly constant → tight, stable min/max bounds, good for identifying *which page this is*.
+- **Across pages** (a wide span of positions), the rotation still accumulates monotonically, just slowly → the *center* of a page's low-frequency bounds drifts systematically as a function of distance from the query.
 
-The high-frequency dimensions are never discarded from the model — they are excluded only from the cheap routing index, and participate fully once a page is selected.
+So the low-frequency index carries two signals simultaneously: a content fingerprint (from the key values themselves) and a coarse, monotonic function of relative distance (from the residual rotation). Pre-RoPE scoring (baseline C) strips positional information out entirely before scoring, retaining only content similarity.
 
-```text
-Full K
- │
- ├───────────────┐
- │               │
- ▼               ▼
-Low-frequency    High-frequency
-RoPE dimensions  RoPE dimensions
- │               │
- ▼               X (excluded from index only)
-min/max index
- │
- ▼
-page score
- │
- ▼
-Top-K pages
- │
- ▼
-full K/V (all dimensions)
- │
- ▼
-exact attention
-```
+**The testable consequence.** If this mechanism is real, method B (low-frequency post-RoPE) should have a measurable recall advantage over method C specifically in the region where content similarity alone is uninformative but distance is informative: **target pages that are far from the query and weakly similar in content, yet still attended to** (e.g., a fact restated in different words far earlier in a document). In every other quadrant (near/high-sim, near/low-sim, far/high-sim), B and C are expected to be roughly comparable, because either the local window already covers it (near) or content similarity alone suffices (high-sim). The "far / low-sim" quadrant is the only place the mechanism predicts a gap — which is why it becomes the decisive stratum in the metric design (Section 5).
 
-**Routing is always rank-then-top-K, never a fixed score threshold** — because attention scores are softmax-normalized across the whole candidate set, so no fixed cutoff has principled meaning; the same score can matter enormously in one query's context and be negligible in another's.
+**Falsification condition.** If B does not outperform C in the far/low-sim quadrant, the mechanism is wrong (or too weak to matter at realistic page granularities), and the original team's choice to abandon RoPE for scoring (baseline C's design decision) is vindicated. That is an acceptable, informative negative result — not a failure of the experiment.
 
 ---
 
-## What Is Explicitly Not Claimed as Novel
+## 4. Experimental Protocol
 
-- Paged KV storage
-- Query-aware KV page selection generally (Quest already does this)
-- KV cache as an "active"/routable memory structure
-- KV compression, sparse attention, or RoPE-aware compression as general categories
+### 4.1 Conditions
 
-## What Is Claimed as Novel
+| Selector | Dimensions used | What it represents |
+|---|---|---|
+| **A** | Full post-RoPE, all dims | Strong baseline (Quest) |
+| **B** | Post-RoPE, low-frequency subset only, fraction swept | Proposed method |
+| **C** | Pre-RoPE keys | Strongest published alternative (Full Attention Strikes Back) |
 
-The specific, narrow combination:
+All three share: same page size, same top-K, same Tier-1 local window, same underlying model and attention kernel. Only the routing index differs.
 
-> **Post-RoPE key vectors** + **low-frequency-only dimension subset** + **min/max page statistics** + **top-K routing.**
+### 4.2 Swept Variable
 
-No published method sits at exactly this point:
+Fraction of low-frequency dimensions retained in B's index: **0%, 5%, 10%, 15%, 25%, 50%, 75%, 100%**, sliced sequentially from lowest frequency upward (never a random subset — frequency order is the whole point). Denser sampling at the low end because that is where a discriminative-vs-noisy cliff, if it exists, is expected to sit. At 0%, B degenerates to "no routing signal" (a sanity floor); at 100%, B collapses to A (a sanity ceiling / consistency check).
 
-| Approach | RoPE kept for routing? | Frequency subset? | Page min/max? |
-|---|---|---|---|
-| Quest | ✅ | ❌ (full-dim) | ✅ |
-| ShadowKV | ✅ | ❌ | ❌ (mean/cosine landmarks) |
-| Full Attention Strikes Back | ❌ (scores pre-RoPE) | — | ❌ |
-| SALS / EliteKV | pre-/transformed representations | different objective | ❌ |
-| **This proposal** | ✅ | ✅ | ✅ |
+### 4.3 Held Constant
 
----
+- `W` (Tier-1 local window size) — fixed once, identical across A, B, C.
+- Page size, top-K, model checkpoint, attention kernel, dataset/task suite.
 
-## The Central Hypothesis (Falsifiable)
+### 4.4 Metrics
 
-> Can a low-frequency post-RoPE page index identify the important KV pages with comparable top-K recall to a full-dimensional page index, while substantially reducing routing computation and metadata bandwidth?
+**Primary: Attention-mass recall.** For each decode step, compute the fraction of the true (full-context) attention distribution's mass that lands on the pages actually selected by the router. This is preferred over raw Page Recall@K because a router can retrieve a page that ultimately receives negligible attention weight — attention-mass recall directly measures whether the *right* pages (in terms of what the model would actually use) were kept.
 
-This is explicitly framed as an open, testable question — not an assumed result.
+**Critical stratification.** Attention-mass recall is broken out into four quadrants per query-target pair:
 
----
+| | High content-similarity | Low content-similarity |
+|---|---|---|
+| **Near (within/just outside Tier 1)** | Q1 | Q2 |
+| **Far (long-range)** | Q3 | **Q4 — decisive quadrant** |
 
-## The Critical Experiment
+Success for method B is defined specifically as: **B's attention-mass recall in Q4 meets or exceeds C's**, at some point on the frequency-fraction sweep, at a routing cost (latency + metadata bandwidth) equal to or lower than C's. Parity or superiority in Q1–Q3 is expected and reassuring but not the deciding test.
 
-Compare three selectors head-to-head:
+**Secondary / cost metrics** (measured alongside, for the full recall-vs-cost curve):
+- Selector latency (wall-clock per decode step, routing computation only).
+- Metadata size / bandwidth (bytes of index read per step).
+- KV bytes actually loaded end-to-end.
+- End-to-end decode latency and GPU HBM utilization.
+- Downstream task quality: perplexity and long-context benchmark accuracy (e.g., needle-in-haystack-style tasks, since these are exactly the far/low-sim scenario Q4 targets).
 
-- **A — Full-dimensional post-RoPE min/max** (Quest's method, the strong baseline)
-- **B — Low-frequency post-RoPE min/max** (this proposal)
-- **C — Pre-RoPE scoring** (the strongest published neighbor, from "Full Attention Strikes Back")
+### 4.5 Mandatory Instrumentation — Outlier Sensitivity
 
-Sweep the fraction of frequency dimensions used by B: 0%, 5%, 10%, 15%, 25%, 50%, 75%, 100% (finer granularity at the low end, since that's where any interesting cliff in recall is likely to sit).
+Because B's index uses strictly fewer dimensions than A's, any single outlier activation within the retained low-frequency subset has proportionally more influence over a page's min/max bounds than it would in a full-dimensional index (where its distortion is diluted across many more dimensions).
 
-For each configuration, measure:
+**Protocol.** For every configuration of B (each point on the frequency sweep), compute per-page bound width twice: once using true min/max, once using a top-1%-magnitude-clipped min/max. Track the divergence between the two as a function of frequency fraction. This is recorded as a diagnostic time series, not acted upon within this experiment.
 
-- Page Recall@K and attention-mass recall (quality of routing)
-- Selector latency and metadata size/bandwidth (cost of routing)
-- KV bytes actually read, end-to-end decode latency, GPU HBM utilization
-- Downstream output quality (perplexity, long-context task accuracy)
-
-**The result that matters** is not whether B beats A — a smaller index is trivially cheaper at some point on the sweep. It's whether B's recall-vs-cost curve reaches or exceeds **C's** curve. C is the real bar, because it represents a prior team's considered choice to abandon RoPE for scoring rather than subset it. If B never matches C, that's a legitimate negative result (confirms C's design choice was right). If B matches or beats C, that's the actual contribution.
+**Decision rule for follow-up work (explicitly out of scope here):** if clipped vs. unclipped bound widths diverge sharply at the frequency fractions that otherwise look most promising in the Q4 recall test, that is the trigger to investigate percentile-based bounds as a mitigation in a subsequent study — not this one.
 
 ---
 
-## Scope Boundaries
+## 5. Decision Tree for Interpreting Results
 
-- **Core, required result**: the three-way selector comparison above.
-- **Secondary, optional, only after the core result lands**: adaptive top-K based on routing-score concentration (spend more bandwidth only on queries whose page scores are ambiguous).
-- **Systems-engineering, not scientific claims**: GPU-resident metadata layout, coalesced page reads, GQA/MQA compatibility, fused routing+attention kernels — worth doing for a real implementation, but not part of what the experiment is meant to establish.
+1. **Does B ever reach A's recall** (any quadrant, any frequency fraction) below 100% dimensions? If yes at fraction `f`, that is the operating point of interest for cost comparison; if only at ~100%, the low-frequency hypothesis is unsupported — the full dimensionality was doing real work.
+2. **Does B beat or match C specifically in Q4** at that same (or lower) cost? 
+ - **Yes** → the macro-positional-decay claim holds; this is the paper's core positive result.
+ - **No** → legitimate negative result; report it as confirmation that Pre-RoPE scoring's design choice (discard position, keep pure semantics) was correct, and note where B still adds value, if anywhere (e.g., cost savings in Q1–Q3 despite no Q4 edge).
+3. **Outlier diagnostic** informs whether any future work on this idea should start with percentile bounds instead of true min/max — independent of the primary yes/no outcome above.
 
 ---
 
-## One-Sentence Abstract
+## 6. What Remains Explicitly Out of Scope
 
-> We investigate a frequency-selective post-RoPE representation for KV-page routing, using compact min/max summaries over low-frequency RoPE components to reduce the cost of query-dependent top-K page selection in long-context decoding.
+Unchanged from the original scope boundaries — kept here for completeness:
+
+- Adaptive top-K based on score concentration (secondary, only after core result lands).
+- GPU-resident metadata layout, coalesced reads, GQA/MQA compatibility, fused kernels — real-implementation concerns, not part of what this experiment needs to establish.
+- Outlier mitigation itself (percentile bounds, clipping strategies) — instrumented but deferred, per Section 4.5.
+
+---
+
+## 7. One-Paragraph Abstract (Final)
+
+We propose a two-tier KV routing scheme for long-context decoding: an always-on local window handles near-neighbor precision via full-dimensional attention, while a compact index built strictly from low-frequency post-RoPE key dimensions routes selection of all older KV pages. We hypothesize this low-frequency index retains a coarse, monotonic positional-decay signal that content-only Pre-RoPE routing discards, and predict a specific, falsifiable advantage in attention-mass recall for targets that are positionally distant but only weakly similar in content — the one quadrant where positional signal is not redundant with semantic signal. The experiment sweeps the retained frequency fraction against two established baselines (full-dimensional post-RoPE routing and Pre-RoPE routing), reports stratified recall-vs-cost curves, and separately instruments — without yet mitigating — the index's sensitivity to activation outliers introduced by dimensionality reduction.
