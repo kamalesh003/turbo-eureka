@@ -204,6 +204,8 @@ The best fraction for B varied by document and layer (50–100%), with 75% and 1
 
 Outlier bound-width diagnostics at each document's best fraction showed 8–11% divergence between true and top-1%-clipped bound widths — a modest, not extreme, sensitivity to outlier magnitude, suggesting B's bounds are not dominated by a handful of extreme activations.
 <img width="960" height="540" alt="Q4 Recovery Across Layers" src="https://github.com/user-attachments/assets/2fcd901d-c761-4909-bd1c-d252429ed3f2" />
+<img width="1189" height="689" alt="output (2)" src="https://github.com/user-attachments/assets/3fdf525f-89b6-4328-81b4-72b124365d4b" />
+
 
 
 ### 5.3 Labeling-parameter sensitivity sweep
