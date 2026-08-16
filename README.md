@@ -1,4 +1,4 @@
-<img width="2315" height="1594" alt="document2_method_ABC_benchmark" src="https://github.com/user-attachments/assets/169cc4fa-d761-4f07-8e05-9100541c5af4" /># Query-Aware Frequency-Domain KV Cache Routing — Technical Documentation
+# Query-Aware Frequency-Domain KV Cache Routing — Technical Documentation
 
 ---
 
