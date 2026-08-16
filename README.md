@@ -1,4 +1,5 @@
-# Query-Aware Frequency-Domain KV Cache Routing — Technical Documentation
+# Query-Aware Frequency-Domain KV Cache Routing 
+# Technical Documentation
 
 ---
 
