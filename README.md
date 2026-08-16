@@ -203,7 +203,7 @@ B beats C in Q4 recovery on all 3 documents at every layer tested. At its best f
 The best fraction for B varied by document and layer (50–100%), with 75% and 100% most common — meaning the low-frequency half of the head dimension is not always sufficient on its own, but a majority of the full dimension can typically be dropped without accuracy loss relative to A.
 
 Outlier bound-width diagnostics at each document's best fraction showed 8–11% divergence between true and top-1%-clipped bound widths — a modest, not extreme, sensitivity to outlier magnitude, suggesting B's bounds are not dominated by a handful of extreme activations.
-<img width="960" height="540" alt="Q4 Recovery Across Layers" src="https://github.com/user-attachments/assets/2fcd901d-c761-4909-bd1c-d252429ed3f2" />
+
 <img width="1189" height="689" alt="output (2)" src="https://github.com/user-attachments/assets/3fdf525f-89b6-4328-81b4-72b124365d4b" />
 
 
