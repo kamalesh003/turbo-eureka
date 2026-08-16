@@ -1,4 +1,4 @@
-# Query-Aware Frequency-Domain KV Cache Routing — Technical Documentation
+<img width="2315" height="1594" alt="document2_method_ABC_benchmark" src="https://github.com/user-attachments/assets/169cc4fa-d761-4f07-8e05-9100541c5af4" /># Query-Aware Frequency-Domain KV Cache Routing — Technical Documentation
 
 ---
 
@@ -170,6 +170,18 @@ Procedure per document:
 | A (full, baseline) | 100% | 96.78% | 45.16% | 141.8 | 262,144 |
 
 Real perplexity impact at this (document, layer): baseline `ppl = 15.06`; A: Δ = −0.004 nats; C: Δ = +0.301 nats (measurable degradation); B at 100%: Δ = −0.004 nats (indistinguishable from A). This pattern — B closing most of the gap to A by the 25–75% fraction range, C lagging far behind on Q4 recovery while visibly hurting perplexity — repeats across all documents and layers tested.
+
+**DOCUMENT-1:**
+<img width="1286" height="886" alt="document1_method_ABC_benchmark" src="https://github.com/user-attachments/assets/92fa63c6-fade-4300-8d47-a1ac26a3607d" />
+
+**DOCUMENT-2:**
+<img width="2315" height="1594" alt="document2_method_ABC_benchmark" src="https://github.com/user-attachments/assets/50ca6159-cbd5-44a0-81ca-94d4e8fb595b" />
+
+**DOCUMENT-3:**
+<img width="2315" height="1594" alt="document3_method_ABC_benchmark" src="https://github.com/user-attachments/assets/7236ff39-ef73-4aa7-95e2-e197e8512484" />
+
+
+
 
 ### 5.2 Cross-document summary (mean ± std across 3 real WikiText windows)
 
