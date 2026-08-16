@@ -216,6 +216,13 @@ Across all 27 tested `(context_tokens, percentile)` combinations:
 
 The result leans toward B but is not uniform: some labeling combinations flip the outcome. This is reported as a boundary condition, not an unconditional win — the B > C conclusion is robust under the large majority of reasonable labeling choices, but not universal.
 
+<img width="1089" height="640" alt="output (1)" src="https://github.com/user-attachments/assets/88a518d0-217c-40c3-8a9f-e8a22925b1ac" />
+
+
+
+<img width="1089" height="640" alt="output" src="https://github.com/user-attachments/assets/c8846673-6c08-4e10-bed7-8a49a4c1d307" />
+
+
 ---
 
 ## 6. Interpretation
