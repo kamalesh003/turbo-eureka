@@ -250,12 +250,6 @@ The result leans toward B but is not uniform: some labeling combinations flip th
 | 10 | Cross-document summary: mean ± std of Q4 recovery and perplexity delta per layer, plus outlier bound-width divergence at each document's best fraction. |
 | 11 | Labeling-robustness sweep: re-scores cached routing decisions across 27 `(context_tokens, percentile)` × layer combinations, tallies win/tie/inconclusive counts, prints overall robustness verdict. |
 
-### 8.1 Reproducing this run
-
-**Requirements**: `torch`, `transformers`, `datasets`, `accelerate`, a CUDA GPU (CPU fallback works but is slow), and network access to the Hugging Face Hub for model/dataset download.
-
-Running the notebook top-to-bottom reproduces the full pipeline. Per-document/layer runtime was approximately 67–73 seconds per combination in the original run — roughly 10 minutes total for 3 documents × 3 layers plus the sensitivity sweep.
-
 ---
 
 ## 9. Glossary
